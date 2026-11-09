@@ -680,16 +680,17 @@ impl App {
                     self.jobs.separate_at(id, "best");
                     self.status = format!("Separating {} in Best quality…", short(&self.sh, id));
                 }
-                M::NewMix(m) => {
+                M::NewMix { forward: m, ret } => {
                     self.eng.stop_preview();
                     self.save_mix();
                     let name = format!("{} × {}", short(&self.sh, m.vocal_track), short(&self.sh, m.inst_track));
-                    if let Some(mut mix) = crate::mashup::mashup_mix(&name, &m, &self.sh.analyses, 16) {
+                    if let Some(mut mix) = crate::mashup::mashup_mix_exchange(&name, &m, ret.as_ref(), &self.sh.analyses, 16) {
                         mix.keylock = self.prefs.mix_keylock;
                         if let Err(e) = self.lib.save_mix(&mut mix) {
                             self.status = format!("save mix: {e}");
                         }
-                        self.status = format!("Created the mix '{}'", mix.name);
+                        let hops = mix.tracks.len().saturating_sub(1);
+                        self.status = format!("Created exchange mashup '{}' ({hops} transitions)", mix.name);
                         self.studio.set_mix(mix);
                         self.studio.selection = crate::studio::Selection::Transition(0);
                         self.refresh_mixes();
@@ -1019,7 +1020,10 @@ impl App {
                 if let Some(m) = self.studio.mashup.result(arg.trim().parse().unwrap_or(0)) {
                     let a = match c {
                         "mashup-preview" => M::Preview(m),
-                        "mashup-newmix" => M::NewMix(m),
+                        "mashup-newmix" => {
+                            let ret = crate::mashup::reciprocal_match(&m, self.studio.mashup.results()).cloned();
+                            M::NewMix { forward: m, ret }
+                        }
                         _ => M::Apply(m, self.studio.mashup.transition_index().unwrap_or(0)),
                     };
                     self.handle_mashup_actions(vec![a]);

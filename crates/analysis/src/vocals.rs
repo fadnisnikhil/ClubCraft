@@ -199,6 +199,60 @@ impl VocalMap {
         }
     }
 
+    /// How quiet the half-bar before `bar` is (0..1): a clean phrase start wants this high.
+    pub fn quiet_before(&self, bar: i32) -> f32 {
+        let s = self.step_of_bar(bar);
+        let half = self.steps_per_bar() / 2;
+        let lo = s - half.max(1);
+        let n = (s - lo).max(1) as f32;
+        (lo..s).filter(|&k| self.is_quiet(k)).count() as f32 / n
+    }
+
+    /// How cleanly the phrase can end at `end_bar` (0..1): quiet around the downbeat (2 beats
+    /// before through 1 beat after), matching [`VocalMap::exit`].
+    pub fn quiet_after(&self, end_bar: i32) -> f32 {
+        let e = self.step_of_bar(end_bar);
+        let b = STEPS_PER_BEAT;
+        let lo = e - 2 * b;
+        let hi = e + b;
+        let n = (hi - lo).max(1) as f32;
+        let quiet = (lo..hi).filter(|&k| self.is_quiet(k)).count() as f32 / n;
+        // a real line break near the end beats a vague dip
+        let has_break = (e - 2 * b..=e + b).any(|k| self.is_break(k));
+        if has_break { quiet.max(0.55) } else { quiet }
+    }
+
+    /// Best `(start_bar, bars, phrase)` near `prefer_start` / `prefer_bars`, snapping both ends to
+    /// quiet downbeats within `±max_shift` bars. Drops unsnappable mid-line cuts (`None`).
+    pub fn snap_phrase(&self, prefer_start: i32, prefer_bars: usize, max_shift: i32) -> Option<(i32, usize, PhraseScore)> {
+        let prefer_bars = prefer_bars.max(4);
+        let mut best: Option<(i32, usize, PhraseScore, f32)> = None;
+        for ds in -max_shift..=max_shift {
+            let start = prefer_start + ds;
+            for dn in -max_shift..=max_shift {
+                let bars = (prefer_bars as i32 + dn).max(4) as usize;
+                // keep phrase lengths on 4-bar lines when possible
+                if !bars.is_multiple_of(4) {
+                    continue;
+                }
+                let p = self.phrase(start, bars);
+                if p.start < 0.5 || p.end < 0.5 {
+                    continue;
+                }
+                let q_pre = self.quiet_before(start);
+                let q_post = self.quiet_after(start + bars as i32);
+                if q_pre < 0.45 || q_post < 0.45 {
+                    continue;
+                }
+                let rank = p.quality * (0.7 + 0.3 * q_pre) * (0.7 + 0.3 * q_post) * (1.0 - 0.03 * ds.unsigned_abs() as f32) * (1.0 - 0.03 * dn.unsigned_abs() as f32);
+                if best.as_ref().is_none_or(|b| rank > b.3) {
+                    best = Some((start, bars, p, rank));
+                }
+            }
+        }
+        best.map(|(s, n, p, _)| (s, n, p))
+    }
+
     /// Score the phrase of `bars` bars from bar `start`.
     pub fn phrase(&self, start: i32, bars: usize) -> PhraseScore {
         let spb = self.steps_per_bar();
@@ -430,6 +484,19 @@ mod tests {
         // a pause at the bar and the line a beat later still counts as a clean entry
         let late = map(32, |k| k >= 68 && k % 32 < 30, varied);
         assert!(late.phrase(4, 8).start > 0.7);
+    }
+
+    #[test]
+    fn snap_phrase_moves_off_mid_line_cuts() {
+        // silence 0..4, sung lines from bar 4 with breaths every 2 bars (32 sixteenths)
+        let m = map(32, |k| k >= 64 && k % 32 < 30, varied);
+        let snapped = m.snap_phrase(5, 8, 2).expect("should snap off the mid-line start");
+        assert_eq!(snapped.0, 4, "{snapped:?}");
+        assert!(snapped.2.start >= 0.5 && snapped.2.end >= 0.5, "{:?}", snapped.2);
+        assert!(m.quiet_before(4) >= 0.5, "quiet before {}", m.quiet_before(4));
+        // a start with no quiet window nearby cannot snap
+        let busy = map(16, |_| true, varied);
+        assert!(busy.snap_phrase(2, 8, 2).is_none());
     }
 
     #[test]

@@ -23,7 +23,8 @@ pub enum Target {
 pub enum MashupAction {
     Preview(Match),
     StopPreview,
-    NewMix(Match),
+    /// Forward mashup plus optional reciprocal so the mix can return A→B→A.
+    NewMix { forward: Match, ret: Option<Match> },
     Insert(Match),
     Apply(Match, usize),
     /// Separate the track again with the best vocal model.
@@ -159,6 +160,10 @@ impl MashupView {
 
     pub fn result(&self, i: usize) -> Option<Match> {
         self.results.get(i).cloned()
+    }
+
+    pub fn results(&self) -> &[Match] {
+        &self.results
     }
 
     fn start(&mut self, mix: &Mix) {
@@ -318,7 +323,7 @@ impl MashupView {
             }
             ui.separator();
             ui.label(RichText::new("Tempo").color(theme::TEXT_DIM));
-            for t in [3u32, 6, 10] {
+            for t in [3u32, 6] {
                 ui.selectable_value(&mut self.tempo_pct, t, format!("±{t} %"));
             }
             ui.separator();
@@ -348,12 +353,11 @@ impl MashupView {
                 }
             }
         });
-        // the fast models leave synths and pads in the vocal stem: the acapella sounds dirty and
-        // the phrase choice can't tell them from singing
+        // Mashup search requires Best (Mel-RoFormer) vocals; Fast leaves synths in the vocal stem.
         let model = self.vocal.filter(|_| self.order == MashupOrder::VocalsFirst).and_then(|v| sh.analyses.get(&v)).and_then(|a| a.stems_model.clone());
         if let (Some(v), Some(model)) = (self.vocal, model.filter(|m| !m.starts_with("melroformer"))) {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("The vocals of this track were separated with {model}, which leaves instruments in the vocal stem.")).size(11.5).color(theme::WARN));
+                ui.label(RichText::new(format!("Best stems required for mashups. This track is {model} — separate in Best before searching.")).size(11.5).color(theme::WARN));
                 if ui.small_button("Separate in Best quality").on_hover_text("Separate this track again with the Mel-RoFormer vocal model (a few minutes). Cleaner acapella, better phrases.").clicked() {
                     out.push(MashupAction::SeparateBest(v));
                 }
@@ -427,8 +431,9 @@ impl MashupView {
                                 }
                             }
                             _ => {
-                                if ui.button("New mix").on_hover_text("Create a mix with this mashup").clicked() {
-                                    out.push(MashupAction::NewMix(m.clone()));
+                                if ui.button("New mix").on_hover_text("Create an A→B→A exchange mashup (returns to the first track)").clicked() {
+                                    let ret = mashup::reciprocal_match(m, &self.results).cloned();
+                                    out.push(MashupAction::NewMix { forward: m.clone(), ret });
                                 }
                                 if vocal_in_mix.is_some() && ui.button("Insert").on_hover_text("Put the other track after this one in the open mix").clicked() {
                                     out.push(MashupAction::Insert(m.clone()));

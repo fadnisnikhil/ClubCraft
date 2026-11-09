@@ -313,6 +313,22 @@ pub enum TransitionStyle {
     Custom,
 }
 
+/// Equal-power (cos/sin) stem crossfade from `Out`→`In` between beats `start` and `end`.
+fn equal_power_stem_swap(out_side: Side, in_side: Side, kind: StemKind, start: f32, end: f32) -> Vec<Lane> {
+    let end = end.max(start + 1e-3);
+    let n = 4;
+    let mut out_pts = Vec::with_capacity(n + 1);
+    let mut in_pts = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        let x = start + (end - start) * t;
+        let (o, inn) = ((std::f32::consts::FRAC_PI_2 * t).cos(), (std::f32::consts::FRAC_PI_2 * t).sin());
+        out_pts.push((x, o));
+        in_pts.push((x, inn));
+    }
+    vec![Lane::new(out_side, Param::Stem(kind), &out_pts), Lane::new(in_side, Param::Stem(kind), &in_pts)]
+}
+
 impl TransitionStyle {
     pub const ALL: [TransitionStyle; 10] = [
         TransitionStyle::StemBlend,
@@ -393,35 +409,33 @@ impl TransitionStyle {
                 Lane::new(In, Volume, &[(0.0, 0.0), (len - 0.01, 0.0), (len, 1.0)]),
             ],
             TransitionStyle::Mashup => {
-                let bar = 4.0f32.min(len * 0.25);
-                vec![
-                    // outgoing: instrumental out over the first bar, vocals until the last bar
-                    Lane::new(Out, Stem(StemKind::Drums), &[(0.0, 1.0), (bar, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Bass), &[(0.0, 1.0), (bar * 0.5 - 0.01, 1.0), (bar * 0.5, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Other), &[(0.0, 1.0), (bar, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Vocals), &[(0.0, 1.0), (len - bar, 1.0), (len, 0.0)]),
-                    // incoming: instrumental in over the first bar, own vocals muted until the end
-                    Lane::new(In, Stem(StemKind::Drums), &[(0.0, 0.0), (bar, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Bass), &[(0.0, 0.0), (bar * 0.5 - 0.01, 0.0), (bar * 0.5, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Other), &[(0.0, 0.0), (bar, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Vocals), &[(0.0, 0.0), (len - 1.0, 0.0), (len, 1.0)]),
-                ]
+                // Instrumentals cross over ~2 bars (equal-power); bass soft-swaps over 2 beats.
+                // Incoming vocals stay fully muted for the whole phrase, then fade in on the last beat.
+                let swap = (8.0f32).min(len * 0.5).max(4.0f32.min(len * 0.25));
+                let bass_w = 2.0f32.min(swap * 0.5);
+                let bass0 = (swap * 0.5 - bass_w * 0.5).max(0.0);
+                let bass1 = (bass0 + bass_w).min(swap);
+                let mut lanes = equal_power_stem_swap(Out, In, StemKind::Drums, 0.0, swap);
+                lanes.extend(equal_power_stem_swap(Out, In, StemKind::Other, 0.0, swap));
+                lanes.extend(equal_power_stem_swap(Out, In, StemKind::Bass, bass0, bass1));
+                lanes.push(Lane::new(Out, Stem(StemKind::Vocals), &[(0.0, 1.0), (len - swap.min(4.0), 1.0), (len, 0.0)]));
+                lanes.push(Lane::new(In, Stem(StemKind::Vocals), &[(0.0, 0.0), (len - 0.25, 0.0), (len, 1.0)]));
+                lanes
             }
             TransitionStyle::MashupIn => {
-                let bar = 4.0f32.min(len * 0.25);
-                let swap = len - bar;
-                vec![
-                    // outgoing: its vocals stop for the new ones, instrumental out over the last bar
+                let swap_len = (8.0f32).min(len * 0.5).max(4.0f32.min(len * 0.25));
+                let swap = (len - swap_len).max(0.0);
+                let bass_w = 2.0f32.min(swap_len * 0.5);
+                let bass0 = swap + (swap_len * 0.5 - bass_w * 0.5).max(0.0);
+                let bass1 = (bass0 + bass_w).min(len);
+                let mut lanes = vec![
                     Lane::new(Out, Stem(StemKind::Vocals), &[(0.0, 0.0), (len, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Drums), &[(0.0, 1.0), (swap, 1.0), (len, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Bass), &[(0.0, 1.0), (swap + bar * 0.5 - 0.01, 1.0), (swap + bar * 0.5, 0.0)]),
-                    Lane::new(Out, Stem(StemKind::Other), &[(0.0, 1.0), (swap, 1.0), (len, 0.0)]),
-                    // incoming: vocals from the start, instrumental in over the last bar
                     Lane::new(In, Stem(StemKind::Vocals), &[(0.0, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Drums), &[(0.0, 0.0), (swap, 0.0), (len, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Bass), &[(0.0, 0.0), (swap + bar * 0.5 - 0.01, 0.0), (swap + bar * 0.5, 1.0)]),
-                    Lane::new(In, Stem(StemKind::Other), &[(0.0, 0.0), (swap, 0.0), (len, 1.0)]),
-                ]
+                ];
+                lanes.extend(equal_power_stem_swap(Out, In, StemKind::Drums, swap, len));
+                lanes.extend(equal_power_stem_swap(Out, In, StemKind::Other, swap, len));
+                lanes.extend(equal_power_stem_swap(Out, In, StemKind::Bass, bass0, bass1));
+                lanes
             }
             TransitionStyle::Cut => vec![
                 Lane::new(Out, Volume, &[(0.0, 1.0), (len - 0.01, 1.0), (len, 0.0)]),
@@ -993,12 +1007,35 @@ mod tests {
     fn mashup_in_puts_the_new_vocals_over_the_old_instrumental() {
         let t = Transition::new(TransitionStyle::MashupIn, 64);
         let v = |side, kind, x| t.value(side, Param::Stem(kind), x);
-        for x in [1.0, 32.0, 59.0] {
+        for x in [1.0, 32.0, 55.0] {
             assert_eq!((v(Side::Out, StemKind::Vocals, x), v(Side::In, StemKind::Vocals, x)), (0.0, 1.0));
-            assert_eq!((v(Side::Out, StemKind::Drums, x), v(Side::In, StemKind::Drums, x)), (1.0, 0.0));
+            assert!((v(Side::Out, StemKind::Drums, x) - 1.0).abs() < 1e-3);
+            assert!(v(Side::In, StemKind::Drums, x) < 1e-3);
         }
-        // the instrumentals swap in the last bar
-        assert_eq!((v(Side::Out, StemKind::Bass, 64.0), v(Side::In, StemKind::Bass, 64.0)), (0.0, 1.0));
+        // instrumentals finish the equal-power swap by the end
+        assert!((v(Side::Out, StemKind::Bass, 64.0) - 0.0).abs() < 1e-3);
+        assert!((v(Side::In, StemKind::Bass, 64.0) - 1.0).abs() < 1e-3);
+        assert!((v(Side::Out, StemKind::Drums, 64.0) - 0.0).abs() < 1e-3);
+        assert!((v(Side::In, StemKind::Drums, 64.0) - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mashup_keeps_incoming_vocals_muted_through_the_phrase() {
+        let t = Transition::new(TransitionStyle::Mashup, 64);
+        let v = |side, kind, x| t.value(side, Param::Stem(kind), x);
+        // no double vocals through the body of the phrase (outgoing fades only in the last bar)
+        for x in [0.0, 8.0, 32.0, 56.0, 59.0] {
+            assert!(v(Side::In, StemKind::Vocals, x) < 0.05, "incoming vocals audible at {x}");
+            assert!(v(Side::Out, StemKind::Vocals, x) > 0.9, "outgoing vocals missing at {x}");
+        }
+        assert!(v(Side::In, StemKind::Vocals, 63.5) < 0.05);
+        assert!((v(Side::In, StemKind::Vocals, 64.0) - 1.0).abs() < 1e-3);
+        // equal-power drums around the midpoint of the 2-bar swap (beat 4 of 8)
+        let (od, id) = (v(Side::Out, StemKind::Drums, 4.0), v(Side::In, StemKind::Drums, 4.0));
+        assert!((od - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.05, "out drums {od}");
+        assert!((id - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.05, "in drums {id}");
+        // energy stays near unity through the swap (no hole, no double-kick spike)
+        assert!((od * od + id * id - 1.0).abs() < 0.08);
     }
 }
 

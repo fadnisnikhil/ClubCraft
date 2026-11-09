@@ -389,6 +389,7 @@ pub struct MatchOptions {
     /// Allowed key shift of the vocals (± semitones).
     pub key_range: i32,
     /// Allowed tempo change of the vocals (fraction, e.g. 0.06 = ±6 %), half/double time allowed.
+    /// Clamped to [`MAX_TEMPO_TOLERANCE`] at search time.
     pub tempo_tolerance: f64,
     /// Phrase grid (bars) for tracks without sections.
     pub step_bars: i32,
@@ -404,9 +405,12 @@ pub struct MatchOptions {
 
 impl Default for MatchOptions {
     fn default() -> Self {
-        MatchOptions { bars: 16, key_range: 2, tempo_tolerance: 0.06, step_bars: 4, vocal_bars: None, inst_bars: None, per_track: 2, max_results: 30, order: MashupOrder::VocalsFirst }
+        MatchOptions { bars: 16, key_range: 2, tempo_tolerance: MAX_TEMPO_TOLERANCE, step_bars: 4, vocal_bars: None, inst_bars: None, per_track: 2, max_results: 30, order: MashupOrder::VocalsFirst }
     }
 }
+
+/// Hard cap on vocal tempo stretch for mashups (±6 %). Wider stretches sound like overlapping beats.
+pub const MAX_TEMPO_TOLERANCE: f64 = 0.06;
 
 /// How the two tracks of a mashup follow each other in a mix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -638,8 +642,8 @@ pub fn phrase_quality(f: &MashupFeatures, start: i32, n: usize) -> f32 {
 /// The vocal phrases of a track worth lifting, best first: whole sung sections (chorus, verse,
 /// bridge by the structure model; without labels the analysed sections, or the phrase grid),
 /// each tried at its start and every 8 bars in, and every start of a sung passage after a
-/// pause; at the full and at half length, with the start moved by up to two bars to where a
-/// line starts.
+/// pause; at the full and at half length. With a vocal map, both ends snap to quiet downbeats
+/// (±2 bars); mid-line cuts are dropped.
 pub fn vocal_units(f: &MashupFeatures, o: &MatchOptions, max: usize) -> Vec<VocalUnit> {
     let mut lens = vec![o.bars];
     if o.bars >= 16 {
@@ -679,22 +683,32 @@ pub fn vocal_units(f: &MashupFeatures, o: &MatchOptions, max: usize) -> Vec<Voca
     starts.sort_unstable();
     starts.dedup();
     let (lo, hi) = o.vocal_bars.unwrap_or((i32::MIN, i32::MAX));
-    // the line search only means something with a vocal map
-    let shifts: &[i32] = if f.vocal_map.is_some() { &[0, -1, 1, -2, 2] } else { &[0] };
     let mut cands: Vec<VocalUnit> = Vec::new();
     for &s0 in &starts {
-        for &n in &lens {
-            let best = shifts
-                .iter()
-                .map(|d| s0 + d)
-                .filter(|&s| s >= f.first_bar && s + n as i32 <= f.last_bar() && (lo..=hi).contains(&s))
-                .map(|s| {
-                    let shorter = if n < o.bars { 0.85 } else { 1.0 };
-                    let head = if heads.contains(&s) { 1.0 } else { 0.95 };
-                    (s, unit_quality(f, s, n) * (1.0 - 0.04 * (s - s0).abs() as f32) * shorter * head)
-                })
-                .max_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((s, q)) = best.filter(|(_, q)| *q > 0.05) {
+        for &n0 in &lens {
+            let snapped = if let Some(m) = &f.vocal_map {
+                m.snap_phrase(s0, n0, 2).filter(|(s, n, _)| *s >= f.first_bar && s + *n as i32 <= f.last_bar() && (lo..=hi).contains(s))
+            } else {
+                None
+            };
+            let (s, n, q) = if let Some((s, n, _)) = snapped {
+                let shorter = if n < o.bars { 0.85 } else { 1.0 };
+                let head = if heads.contains(&s) || heads.contains(&s0) { 1.0 } else { 0.95 };
+                let q = unit_quality(f, s, n) * (1.0 - 0.04 * (s - s0).abs() as f32) * shorter * head;
+                (s, n, q)
+            } else if f.vocal_map.is_some() {
+                // vocal map present but no clean quiet boundaries: drop this candidate
+                continue;
+            } else {
+                let s = s0;
+                if !(s >= f.first_bar && s + n0 as i32 <= f.last_bar() && (lo..=hi).contains(&s)) {
+                    continue;
+                }
+                let shorter = if n0 < o.bars { 0.85 } else { 1.0 };
+                let head = if heads.contains(&s) { 1.0 } else { 0.95 };
+                (s, n0, unit_quality(f, s, n0) * shorter * head)
+            };
+            if q > 0.05 {
                 cands.push(VocalUnit { bar: s, bars: n, role: role_at(f, s, n), quality: q });
             }
         }
@@ -836,8 +850,10 @@ fn slots(f: &MashupFeatures, o: &MatchOptions, n: usize) -> Vec<i32> {
 
 // ------------------------------------------------------------------ scoring
 
-/// Tempo ratio folded to half / double time; `None` outside the tolerance.
+/// Tempo ratio folded to half / double time; `None` outside the tolerance (capped at
+/// [`MAX_TEMPO_TOLERANCE`]).
 pub fn tempo_ratio(vocal_bpm: f64, inst_bpm: f64, tol: f64) -> Option<f64> {
+    let tol = tol.min(MAX_TEMPO_TOLERANCE);
     let r = [1.0, 2.0, 0.5].iter().map(|m| inst_bpm / (vocal_bpm * m)).min_by(|a, b| (a.ln().abs()).total_cmp(&b.ln().abs()))?;
     ((r - 1.0).abs() <= tol + 1e-9).then_some(r)
 }
@@ -934,7 +950,8 @@ fn score_with(v: &MashupFeatures, p: &Phrase, key_shift: i32, kernels: &[Option<
         MashupOrder::VocalsFirst => 1.0,
         MashupOrder::InstrumentalFirst => 0.5 + 0.5 * smoothstep((0.95 - (vbar + n as i32 - v.first_bar) as f32 / v.bars.len().max(1) as f32) / 0.2),
     };
-    let tempo_cost = (((ratio - 1.0).abs() / o.tempo_tolerance.max(0.01)) as f32).powi(2) * 0.08;
+    let tempo_tol = o.tempo_tolerance.clamp(0.01, MAX_TEMPO_TOLERANCE);
+    let tempo_cost = (((ratio - 1.0).abs() / tempo_tol) as f32).powi(2) * 0.08;
     // listeners prefer vocals in their own key (HKUST); DJs shift one or two semitones at most
     let cost = tempo_cost + key_shift.unsigned_abs() as f32 * 0.06;
     Some(Match {
@@ -1138,6 +1155,11 @@ mod tests {
         assert!((tempo_ratio(124.0, 126.0, 0.06).unwrap() - 126.0 / 124.0).abs() < 1e-9);
         assert!((tempo_ratio(64.0, 126.0, 0.06).unwrap() - 126.0 / 128.0).abs() < 1e-9);
         assert!(tempo_ratio(110.0, 128.0, 0.06).is_none());
+        // just inside / outside ±6 %, and a wider caller tolerance is still capped
+        let edge = 124.0 * 1.06;
+        assert!(tempo_ratio(124.0, edge, 0.06).is_some());
+        assert!(tempo_ratio(124.0, 124.0 * 1.061, 0.06).is_none());
+        assert!(tempo_ratio(110.0, 128.0, 0.20).is_none());
     }
 
     #[test]

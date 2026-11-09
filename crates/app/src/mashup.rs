@@ -16,7 +16,7 @@
 //! Both ways round: the track's vocals over the other tracks' instrumentals (old vocals in the
 //! new song, [`TransitionStyle::Mashup`]) or the other tracks' vocals over its instrumental (new
 //! vocals in the old song, [`TransitionStyle::MashupIn`]); the track plays first either way. A
-//! match becomes a two-track mix (or part of a mix) joined by that transition.
+//! match becomes an exchange mix (A→B→A) by default, or part of a mix joined by that transition.
 
 use anyhow::{bail, Context, Result};
 use clubcraft_analysis::mashup::{self as mm, MashupFeatures, MashupOrder, Match, MatchOptions};
@@ -81,6 +81,10 @@ fn prepare_vocals(lib: &Library, analyses: &HashMap<TrackId, Analysis>, id: Trac
     Ok(())
 }
 
+fn stems_best(a: &Analysis) -> bool {
+    a.stems_model.as_deref().is_some_and(|m| crate::pipeline::model_rank(m) >= crate::pipeline::model_rank("melroformer+htdemucs_ft"))
+}
+
 /// Run a query (blocking; call from a worker thread). `progress(fraction, label)`.
 pub fn run(q: &Query, cancel: &AtomicBool, progress: &mut dyn FnMut(f32, &str)) -> Result<Vec<Match>> {
     let lib = Library::open_default()?;
@@ -88,6 +92,10 @@ pub fn run(q: &Query, cancel: &AtomicBool, progress: &mut dyn FnMut(f32, &str)) 
     let has_stems = |id: TrackId| analyses.get(&id).is_some_and(|a| a.stems_model.is_some());
     if !has_stems(q.track) {
         bail!("the track has no stems yet; separate it first");
+    }
+    // Mashup phrase picking needs Mel-RoFormer vocals; Fast stems leave synths in the vocal stem.
+    if q.order == MashupOrder::VocalsFirst && !analyses.get(&q.track).is_some_and(stems_best) {
+        bail!("mashup search needs Best-quality stems on the vocal track (Mel-RoFormer); separate it in Best quality first");
     }
     let mut ids: Vec<TrackId> = match &q.candidates {
         Some(c) => c.clone(),
@@ -123,7 +131,12 @@ pub fn run(q: &Query, cancel: &AtomicBool, progress: &mut dyn FnMut(f32, &str)) 
     }
     let rerank_on = q.rerank && rerank_available();
     // re-ranking always looks at the best RERANK_TOP, the list is cut afterwards
-    let opts = MatchOptions { max_results: if rerank_on { q.opts.max_results.max(RERANK_TOP) } else { q.opts.max_results }, order: q.order, ..q.opts.clone() };
+    let opts = MatchOptions {
+        max_results: if rerank_on { q.opts.max_results.max(RERANK_TOP) } else { q.opts.max_results },
+        order: q.order,
+        tempo_tolerance: q.opts.tempo_tolerance.min(mm::MAX_TEMPO_TOLERANCE),
+        ..q.opts.clone()
+    };
     let units_of = |f: &MashupFeatures, max: usize| match q.vocal_bar {
         Some(b) => vec![mm::unit_at(f, b, &opts)],
         None => mm::vocal_units(f, &opts, max),
@@ -152,9 +165,17 @@ pub fn run(q: &Query, cancel: &AtomicBool, progress: &mut dyn FnMut(f32, &str)) 
         }
         MashupOrder::InstrumentalFirst => {
             // every other track's vocals over this instrumental: each needs its vocal map (once,
-            // ~1 s); the structure labels are used where they are cached
+            // ~1 s); the structure labels are used where they are cached. Prefer Best stems for
+            // vocal-giving tracks (skip Fast-only acapellas that leak synths).
             let inst = feats.remove(&q.track).context("no features for the track")?;
-            let mut voc: Vec<TrackId> = feats.iter().filter(|(_, g)| mm::tempo_ratio(g.bpm, inst.bpm, opts.tempo_tolerance).is_some()).map(|(id, _)| *id).collect();
+            let mut voc: Vec<TrackId> = feats
+                .iter()
+                .filter(|(id, g)| mm::tempo_ratio(g.bpm, inst.bpm, opts.tempo_tolerance).is_some() && analyses.get(id).is_some_and(stems_best))
+                .map(|(id, _)| *id)
+                .collect();
+            if voc.is_empty() {
+                bail!("no candidate vocal tracks with Best-quality stems (Mel-RoFormer); separate partners in Best quality first");
+            }
             voc.sort_unstable();
             let nv = voc.len();
             let mut found = Vec::new();
@@ -333,19 +354,67 @@ fn second_shift(m: &Match, first: i32) -> i32 {
     }
 }
 
-/// A two-track mix in the match's order: the first track plays `lead_bars` before the mashup,
-/// then the vocals sing over the instrumental, and the second track plays on to its end.
+/// A mashup mix in the match's order. Prefer [`mashup_mix_exchange`] so the set can return to A
+/// instead of ending as a one-way A→B handoff.
 pub fn mashup_mix(name: &str, m: &Match, analyses: &HashMap<TrackId, Analysis>, lead_bars: i32) -> Option<Mix> {
-    let ((a, ta), (b, tb), style) = ordered(m, analyses)?;
+    mashup_mix_exchange(name, m, None, analyses, lead_bars)
+}
+
+/// Build a mashup that goes **back and forth**: A → mashup → B → return → A.
+///
+/// `forward` is the primary match (A first). `ret` is an optional reciprocal (B vocals over A).
+/// Without `ret`, B still hands back to a later section of A with a stem blend so the mix is not
+/// a one-way dead-end.
+pub fn mashup_mix_exchange(name: &str, forward: &Match, ret: Option<&Match>, analyses: &HashMap<TrackId, Analysis>, lead_bars: i32) -> Option<Mix> {
+    let ((a, ta), (b, tb), style) = ordered(forward, analyses)?;
     let ga = analyses.get(&a)?.grid?;
+    let gb = analyses.get(&b)?.grid?;
     let start = ga.time_of_bar((ga.bar_at(ta).round() as i32 - lead_bars).max(0) as f64).max(0.0);
-    let shift_a = if a == m.vocal_track { m.key_shift } else { 0 };
+    let shift_a = if a == forward.vocal_track { forward.key_shift } else { 0 };
+    let shift_b = second_shift(forward, shift_a);
+    let dur_a = analyses.get(&a).map(|x| x.duration).unwrap_or(ta + 60.0);
+    let dur_b = analyses.get(&b).map(|x| x.duration).unwrap_or(tb + 60.0);
+    let alone = ret.map(|r| r.bars.max(8)).unwrap_or(forward.bars.max(8)) as i32;
+
     let mut mix = Mix { name: name.to_string(), tempo: TempoMode::Glide, ..Default::default() };
     mix.tracks.push(MixTrack { track_id: a, mix_in: start.min(ta), mix_out: ta, key_shift: shift_a, gain_db: 0.0, stems: Vec::new() });
-    mix.tracks.push(MixTrack { track_id: b, mix_in: tb, mix_out: analyses.get(&b).map(|x| x.duration).unwrap_or(tb + 60.0).max(tb + 1.0), key_shift: second_shift(m, shift_a), gain_db: 0.0, stems: Vec::new() });
-    mix.transitions.push(Transition::new(style, m.bars as u32 * 4));
+
+    let (b_out, a_back_in, a_back_out, back_style, back_beats, a_back_shift) = if let Some(r) = ret {
+        if let Some(((first, t_first), (second, t_second), st)) = ordered(r, analyses) {
+            if first == b && second == a {
+                let shift = second_shift(r, shift_b);
+                let out = analyses.get(&a).map(clubcraft_core::planner::default_mix_out).unwrap_or(dur_a).max(t_second + 1.0);
+                (t_first.clamp(tb + 1.0, dur_b.max(tb + 1.0)), t_second, out.min(dur_a).max(t_second + 1.0), st, (r.bars as u32 * 4).max(16), shift)
+            } else {
+                let bout = gb.time_of_bar(gb.bar_at(tb).round() + alone as f64).clamp(tb + 1.0, dur_b.max(tb + 1.0));
+                let ain = ga.time_of_bar(ga.bar_at(ta).round() + forward.bars as f64 + 8.0).min(dur_a - 1.0).max(0.0);
+                let aout = analyses.get(&a).map(clubcraft_core::planner::default_mix_out).unwrap_or(dur_a).max(ain + 1.0);
+                (bout, ain, aout, TransitionStyle::MashupIn, (r.bars as u32 * 4).max(16), shift_a)
+            }
+        } else {
+            return None;
+        }
+    } else {
+        let bout = gb.time_of_bar(gb.bar_at(tb).round() + alone as f64).clamp(tb + 1.0, dur_b.max(tb + 1.0));
+        let ain = ga.time_of_bar(ga.bar_at(ta).round() + forward.bars as f64 + 8.0).min(dur_a - 1.0).max(0.0);
+        let aout = analyses.get(&a).map(clubcraft_core::planner::default_mix_out).unwrap_or(dur_a).max(ain + 1.0);
+        (bout, ain, aout, TransitionStyle::StemBlend, 32, shift_a)
+    };
+
+    mix.tracks.push(MixTrack { track_id: b, mix_in: tb, mix_out: b_out, key_shift: shift_b, gain_db: 0.0, stems: Vec::new() });
+    mix.transitions.push(Transition::new(style, forward.bars as u32 * 4));
+    mix.tracks.push(MixTrack { track_id: a, mix_in: a_back_in, mix_out: a_back_out, key_shift: a_back_shift, gain_db: 0.0, stems: Vec::new() });
+    mix.transitions.push(Transition::new(back_style, back_beats));
     mix.normalize();
     Some(mix)
+}
+
+/// Best reciprocal match for `forward`: the other track's vocals over the first track.
+pub fn reciprocal_match<'a>(forward: &Match, candidates: &'a [Match]) -> Option<&'a Match> {
+    candidates
+        .iter()
+        .filter(|m| m.vocal_track == forward.inst_track && m.inst_track == forward.vocal_track && m.score >= 0.35 && (m.tempo_ratio - 1.0).abs() <= mm::MAX_TEMPO_TOLERANCE + 1e-9)
+        .max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
 /// Make transition `k` of `mix` (tracks `k` → `k + 1`) the mashup `m`.
@@ -379,4 +448,81 @@ pub fn insert_after(mix: &mut Mix, k: usize, m: &Match, analyses: &HashMap<Track
     mix.transitions.insert(k, Transition::new(style, m.bars as u32 * 4));
     mix.normalize();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clubcraft_analysis::mashup::{MashupOrder, VocalRole};
+    use clubcraft_core::BeatGrid;
+
+    fn an(bpm: f64, dur: f64) -> Analysis {
+        Analysis { version: 1, duration: dur, grid: Some(BeatGrid::new(bpm, 0.0)), ..Default::default() }
+    }
+
+    fn m(vocal: TrackId, inst: TrackId, vbar: i32, ibar: i32, bars: usize, order: MashupOrder) -> Match {
+        Match {
+            vocal_track: vocal,
+            vocal_bar: vbar,
+            vocal_role: VocalRole::Chorus,
+            inst_track: inst,
+            inst_bar: ibar,
+            bars,
+            key_shift: 0,
+            tempo_ratio: 1.0,
+            score: 0.7,
+            fit: 0.7,
+            harmony: 0.7,
+            harmony_min: 0.6,
+            masking: 0.0,
+            residual_vocals: 0.0,
+            placement: 0.8,
+            phrase: 0.8,
+            cost: 0.0,
+            per_bar: vec![0.7; bars],
+            learned: None,
+            order,
+        }
+    }
+
+    #[test]
+    fn mashup_exchange_returns_to_first_track() {
+        let mut analyses = HashMap::new();
+        analyses.insert(1, an(124.0, 300.0));
+        analyses.insert(2, an(124.0, 300.0));
+        let forward = m(1, 2, 32, 40, 16, MashupOrder::VocalsFirst);
+        let mix = mashup_mix_exchange("test", &forward, None, &analyses, 8).expect("mix");
+        assert_eq!(mix.tracks.len(), 3, "A → B → A");
+        assert_eq!(mix.transitions.len(), 2);
+        assert_eq!(mix.tracks[0].track_id, 1);
+        assert_eq!(mix.tracks[1].track_id, 2);
+        assert_eq!(mix.tracks[2].track_id, 1);
+        assert_eq!(mix.transitions[0].style, TransitionStyle::Mashup);
+        assert_eq!(mix.transitions[1].style, TransitionStyle::StemBlend);
+    }
+
+    #[test]
+    fn mashup_exchange_uses_reciprocal_return() {
+        let mut analyses = HashMap::new();
+        analyses.insert(1, an(124.0, 300.0));
+        analyses.insert(2, an(124.0, 300.0));
+        let forward = m(1, 2, 16, 32, 16, MashupOrder::VocalsFirst);
+        let ret = m(2, 1, 48, 64, 16, MashupOrder::VocalsFirst);
+        let mix = mashup_mix_exchange("test", &forward, Some(&ret), &analyses, 8).expect("mix");
+        assert_eq!(mix.tracks.iter().map(|t| t.track_id).collect::<Vec<_>>(), vec![1, 2, 1]);
+        assert_eq!(mix.transitions[0].style, TransitionStyle::Mashup);
+        assert_eq!(mix.transitions[1].style, TransitionStyle::Mashup);
+    }
+
+    #[test]
+    fn reciprocal_match_picks_swapped_pair() {
+        let forward = m(1, 2, 16, 32, 16, MashupOrder::VocalsFirst);
+        let good = m(2, 1, 40, 48, 16, MashupOrder::VocalsFirst);
+        let mut better = good.clone();
+        better.score = 0.9;
+        let noise = m(3, 1, 0, 0, 8, MashupOrder::VocalsFirst);
+        let cands = vec![noise, good, better.clone()];
+        let got = reciprocal_match(&forward, &cands).expect("reciprocal");
+        assert_eq!((got.vocal_track, got.inst_track, got.score), (2, 1, 0.9));
+    }
 }

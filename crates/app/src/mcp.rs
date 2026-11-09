@@ -929,7 +929,7 @@ fn find_mashups(lib: &Library, a: &Value, call: &Call) -> Result<Value> {
     let opts = clubcraft_analysis::mashup::MatchOptions {
         bars: a.get("bars").and_then(|v| v.as_u64()).unwrap_or(16).clamp(4, 64) as usize,
         key_range: a.get("key_range").and_then(|v| v.as_i64()).unwrap_or(2).clamp(0, 6) as i32,
-        tempo_tolerance: opt_f64(a, "tempo_tolerance_pct").unwrap_or(6.0).clamp(0.0, 20.0) / 100.0,
+        tempo_tolerance: opt_f64(a, "tempo_tolerance_pct").unwrap_or(6.0).clamp(0.0, 6.0) / 100.0,
         max_results: a.get("limit").and_then(|v| v.as_u64()).unwrap_or(15).clamp(1, 100) as usize,
         ..Default::default()
     };
